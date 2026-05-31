@@ -95,13 +95,36 @@ CREATE TABLE IF NOT EXISTS news_sentiment (
     date TEXT NOT NULL,                     -- 新闻日期
     title TEXT NOT NULL,                    -- 新闻标题
     source TEXT DEFAULT '',                 -- 新闻来源
-    sentiment TEXT DEFAULT '',             -- 情感标签
-    confidence REAL DEFAULT 0.0           -- 置信度
+    sentiment TEXT DEFAULT '',              -- 情感标签
+    confidence REAL DEFAULT 0.0,            -- 置信度
+    cached_at TEXT DEFAULT '',              -- 入库/更新时间（ISO8601，用于 24h 复用）
+    UNIQUE(code, date, title)
 );
 
 CREATE INDEX IF NOT EXISTS idx_news_code ON news_sentiment(code);
 CREATE INDEX IF NOT EXISTS idx_news_date ON news_sentiment(date);
+CREATE INDEX IF NOT EXISTS idx_news_cached_at ON news_sentiment(cached_at);
 """
+
+
+def _migrate_news_sentiment(conn: sqlite3.Connection):
+    """news_sentiment：去重、补 cached_at、确保业务唯一索引。"""
+    _ensure_column(conn, "news_sentiment", "cached_at", "TEXT", "''")
+    conn.execute(
+        """UPDATE news_sentiment
+           SET cached_at = date || 'T12:00:00'
+           WHERE cached_at = '' OR cached_at IS NULL"""
+    )
+    conn.execute(
+        """DELETE FROM news_sentiment
+           WHERE id NOT IN (
+               SELECT MIN(id) FROM news_sentiment GROUP BY code, date, title
+           )"""
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_news_code_date_title
+           ON news_sentiment(code, date, title)"""
+    )
 
 
 class Database:
@@ -159,6 +182,7 @@ class Database:
         conn.executescript(CREATE_TABLES_SQL)       # 自动建表
         # 老版本数据库 schema 迁移（chart_path 是后期新增字段）
         _ensure_column(conn, "reports", "chart_path", "TEXT", "''")
+        _migrate_news_sentiment(conn)
         conn.commit()
         return conn
 
@@ -361,10 +385,14 @@ class Database:
         """
         if not news_list:
             return
-        sql = """INSERT OR REPLACE INTO news_sentiment (code, date, title, source, sentiment, confidence)
-                 VALUES (?, ?, ?, ?, ?, ?)"""
-        data = [(n.code, n.date, n.title, n.source, n.sentiment, n.confidence)
-                for n in news_list]
+        now = datetime.now().isoformat(timespec="seconds")
+        sql = """INSERT OR REPLACE INTO news_sentiment
+                 (code, date, title, source, sentiment, confidence, cached_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"""
+        data = [
+            (n.code, n.date, n.title, n.source, n.sentiment, n.confidence, now)
+            for n in news_list
+        ]
         self._executemany_write(sql, data)
 
     def get_news(self, code: str, limit: int = 20) -> list[NewsItem]:
@@ -401,11 +429,21 @@ class Database:
             NewsItem 列表（按日期倒序）；窗口内无缓存时返回空列表
         """
         from datetime import datetime, timedelta
-        cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d")
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat(timespec="seconds")
         rows = self.execute(
             """SELECT * FROM news_sentiment
-               WHERE code = ? AND date >= ? AND sentiment != ''
+               WHERE code = ? AND cached_at >= ? AND sentiment != ''
                ORDER BY date DESC LIMIT ?""",
-            (code, cutoff, limit)
+            (code, cutoff, limit),
+        ).fetchall()
+        return [NewsItem.from_dict(dict(r)) for r in rows]
+
+    def get_news_with_sentiment(self, code: str, limit: int = 20) -> list[NewsItem]:
+        """获取已完成情感分析的新闻（不限时间窗口，按新闻日期倒序）。"""
+        rows = self.execute(
+            """SELECT * FROM news_sentiment
+               WHERE code = ? AND sentiment != ''
+               ORDER BY date DESC LIMIT ?""",
+            (code, limit),
         ).fetchall()
         return [NewsItem.from_dict(dict(r)) for r in rows]

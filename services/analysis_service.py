@@ -266,18 +266,28 @@ class AnalysisService:
                     name: str = "") -> dict:
         progress("正在加载新闻...")
         from config.settings import Settings
+        from indicators.constants import NEWS_FETCH_LIMIT
         settings = Settings()
         news_list = fetch_news(
             name=name, code=code, market=market,
             model=settings.get("llm_model", ""),
             base_url=settings.get("llm_base_url", ""),
             api_key=settings.get("llm_api_key", ""),
+            limit=NEWS_FETCH_LIMIT,
         )
         logger.info(f"新闻: {len(news_list)} 条")
 
-        if news_list:
+        pending = [n for n in news_list if not (n.sentiment or "").strip()]
+        if pending:
             progress("正在进行新闻情感分析...")
-            news_list = analyze(news_list)
+            analyzed = analyze(pending)
+            analyzed_map = {(str(n.date)[:10], n.title): n for n in analyzed}
+            news_list = [
+                analyzed_map.get((str(n.date)[:10], n.title), n)
+                for n in news_list
+            ]
+
+        if news_list:
             Database().insert_news(news_list)
 
         news_agg = aggregate(news_list)

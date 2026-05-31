@@ -2,17 +2,22 @@
 新闻获取模块。
 
 流程：
-  1. 查数据库 → 今天新闻 >= 5 条 → 直接用缓存
-  2. 否则 → 调 LLM 获取 → 写入数据库 → 交给 FinBERT 分析
+  1. 查数据库 24h 内已分析新闻 >= NEWS_CACHE_MIN_ITEMS → 直接复用
+  2. 否则 → 调 LLM 获取 → 交给 FinBERT 分析（由 analysis_service 写入 DB）
+  3. LLM 失败 / 未配置 Key → 降级为库内历史已分析新闻
 """
 
 import json
 import logging
 import re
-from datetime import date
 
 from data.models import NewsItem
 from data.database import Database
+from indicators.constants import (
+    NEWS_CACHE_HOURS,
+    NEWS_CACHE_MIN_ITEMS,
+    NEWS_FETCH_LIMIT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,10 +42,32 @@ _NEWS_PROMPT_CN = """你是一位专业的财经新闻编辑。请从正规财�
 ]"""
 
 
+def _cache_min_items(limit: int) -> int:
+    return min(NEWS_CACHE_MIN_ITEMS, limit)
+
+
+def _load_cached(code: str, limit: int, hours: int = NEWS_CACHE_HOURS) -> list[NewsItem]:
+    db = Database()
+    cached = db.get_recent_news_with_sentiment(code, hours=hours, limit=limit)
+    return cached[:limit]
+
+
+def _fallback_news(code: str, limit: int) -> list[NewsItem]:
+    """LLM 不可用时的降级：先 24h 缓存，再全库已分析新闻。"""
+    recent = _load_cached(code, limit, hours=NEWS_CACHE_HOURS)
+    if recent:
+        logger.info(f"新闻降级: 使用 24h 内缓存 {len(recent)} 条")
+        return recent
+    historical = Database().get_news_with_sentiment(code, limit=limit)
+    if historical:
+        logger.info(f"新闻降级: 使用历史已分析新闻 {len(historical)} 条")
+    return historical
+
+
 def fetch_news(
     name: str, code: str, market: str,
     model: str, base_url: str, api_key: str,
-    limit: int = 5,
+    limit: int | None = None,
 ) -> list[NewsItem]:
     """
     获取股票新闻（缓存优先，LLM 兜底）。
@@ -50,22 +77,29 @@ def fetch_news(
         code: 股票代码
         market: 市场 (A/US)
         model/base_url/api_key: LLM 配置
-        limit: 最大条数
+        limit: 最大条数（默认 NEWS_FETCH_LIMIT）
 
     Returns:
-        NewsItem 列表（不含情感标签，需 FinBERT 分析）
+        NewsItem 列表（缓存命中时含情感标签；LLM 新拉取的不含，需 FinBERT）
     """
-    # 1. 查缓存：今天至少有 5 条新闻就直接用
-    today_str = date.today().isoformat()
-    cached = Database().get_news(code, limit=50)
-    today_cached = [n for n in cached if str(n.date)[:10] == today_str]
-    if len(today_cached) >= limit:
-        recent = sorted(cached, key=lambda n: str(n.date), reverse=True)[:limit]
-        logger.info(f"新闻缓存命中: {len(recent)} 条 (今日 {len(today_cached)} 条)")
-        return recent
+    limit = limit or NEWS_FETCH_LIMIT
+    min_items = _cache_min_items(limit)
 
-    # 2. 调 LLM 获取
-    logger.info(f"缓存不足 (今日 {len(today_cached)} 条)，调用 LLM...")
+    cached = _load_cached(code, limit)
+    if len(cached) >= min_items:
+        logger.info(
+            f"新闻缓存命中: {len(cached)} 条 "
+            f"({NEWS_CACHE_HOURS}h 内已分析, 阈值 {min_items})"
+        )
+        return cached
+
+    if not (api_key or "").strip():
+        logger.warning("LLM API Key 未配置，跳过在线抓取")
+        return _fallback_news(code, limit)
+
+    logger.info(
+        f"缓存不足 ({len(cached)}/{min_items} 条)，调用 LLM 获取新闻..."
+    )
 
     prompt_template = _NEWS_PROMPT_EN if market == "US" else _NEWS_PROMPT_CN
     prompt = prompt_template.format(name=name, code=code, limit=limit)
@@ -84,25 +118,24 @@ def fetch_news(
 
         items = _parse_llm_json(response, code, limit)
         logger.info(f"LLM 新闻: 解析出 {len(items)} 条")
-        if items:
-            Database().insert_news(items)
-        else:
-            logger.warning(f"LLM 新闻解析为空，原始响应前 300 字符: {response[:300]}")
+        if not items:
+            logger.warning(
+                f"LLM 新闻解析为空，原始响应前 300 字符: {response[:300]}"
+            )
+            return _fallback_news(code, limit)
         return items
 
     except Exception as e:
         logger.error(f"LLM 新闻获取失败: {e}", exc_info=True)
-        return []
+        return _fallback_news(code, limit)
 
 
 def _parse_llm_json(response: str, code: str, limit: int) -> list[NewsItem]:
     """解析 LLM 返回的 JSON 新闻列表。"""
-    # 去掉 ```json ... ``` 包裹
     response = re.sub(r"```(?:json)?\s*", "", response)
     response = re.sub(r"\s*```", "", response)
     response = response.strip()
 
-    # 找到 JSON 数组
     match = re.search(r"\[\s*\{[\s\S]*\}\s*\]", response)
     json_str = match.group(0) if match else response
 
@@ -123,6 +156,5 @@ def _parse_llm_json(response: str, code: str, limit: int) -> list[NewsItem]:
             ))
         except (KeyError, ValueError, TypeError):
             continue
-    # 确保按日期倒序（代码层兜底，即使 LLM 返回顺序有误也纠正）
     items.sort(key=lambda n: str(n.date), reverse=True)
     return items

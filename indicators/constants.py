@@ -12,6 +12,9 @@ SENTIMENT_BATCH_SIZE = 16
 # 新闻在数据库中的有效复用窗口（小时）—— 同一只股票 24 小时内不重复抓取
 NEWS_CACHE_HOURS = 24
 
+# 缓存命中所需的最少条数（已有情感标签）
+NEWS_CACHE_MIN_ITEMS = 5
+
 # 单次抓取/分析的新闻条数上限
 NEWS_FETCH_LIMIT = 15
 
